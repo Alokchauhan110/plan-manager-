@@ -11,7 +11,6 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # --- CONFIGURATION ---
-# These are loaded from Render Environment Variables
 TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URL = os.getenv("MONGO_URL")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
@@ -20,14 +19,14 @@ PORT = int(os.environ.get("PORT", 5000))
 # --- DATABASE SETUP ---
 client = AsyncIOMotorClient(MONGO_URL)
 db = client['subscription_bot']
-channels_col = db['channels']      # Stores channel info
-subs_col = db['subscriptions']     # Stores user subscriptions
+channels_col = db['channels']      
+subs_col = db['subscriptions']     
 
 # --- LOGGING ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- WEB SERVER FOR RENDER (Keep-Alive) ---
+# --- WEB SERVER (Keep-Alive) ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -35,7 +34,6 @@ def health_check():
     return "Bot is running!"
 
 def run_flask():
-    # Runs the web server on the port Render provides
     app.run(host="0.0.0.0", port=PORT)
 
 # --- HELPER: CHECK ADMIN ---
@@ -53,19 +51,23 @@ async def add_channel_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         args = context.args
         if len(args) < 3:
-            await update.message.reply_text("Usage: /addchannel -100xxxxxx 10USD VIP_Channel")
+            await update.message.reply_text("Usage: /addchannel -100xxxxxx 200INR VIP_Channel")
             return
 
         ch_id = args[0]
         price = args[1]
         name = " ".join(args[2:])
         
+        # Check if channel exists to preserve demo link if not provided here
+        existing = await channels_col.find_one({"channel_id": ch_id})
+        demo_link = existing.get('demo_link', "None") if existing else "None"
+
         await channels_col.update_one(
             {"channel_id": ch_id},
-            {"$set": {"channel_id": ch_id, "price": price, "name": name, "demo_link": "None"}},
+            {"$set": {"channel_id": ch_id, "price": price, "name": name, "demo_link": demo_link}},
             upsert=True
         )
-        await update.message.reply_text(f"✅ Channel '{name}' added/updated.")
+        await update.message.reply_text(f"✅ Channel '{name}' added/updated.\nPrice: {price}")
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -75,8 +77,13 @@ async def set_demo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         ch_id = context.args[0]
         link = context.args[1]
-        await channels_col.update_one({"channel_id": ch_id}, {"$set": {"demo_link": link}})
-        await update.message.reply_text("✅ Demo link updated.")
+        
+        result = await channels_col.update_one({"channel_id": ch_id}, {"$set": {"demo_link": link}})
+        
+        if result.matched_count > 0:
+            await update.message.reply_text(f"✅ Demo link updated for {ch_id}.\nLink: {link}")
+        else:
+            await update.message.reply_text("❌ Channel ID not found. Add the channel first.")
     except:
         await update.message.reply_text("Usage: /setdemo <channel_id> <link>")
 
@@ -92,7 +99,7 @@ async def grant_access_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Usage: /grant 123456789 -100xxxxxx 30")
         return
 
-    # 1. Generate Unique Link (Limit 1 user)
+    # 1. Generate Unique Link
     try:
         invite_link = await context.bot.create_chat_invite_link(
             chat_id=ch_id, 
@@ -129,18 +136,29 @@ async def grant_access_command(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         await context.bot.send_message(chat_id=user_id, text=msg, parse_mode='Markdown')
     except:
-        await update.message.reply_text("⚠️ User hasn't started the bot, send the link manually.")
+        await update.message.reply_text("⚠️ User hasn't started the bot, please send the link manually.")
 
 # --- USER COMMANDS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles both /start command and 'Back' button"""
+    user_first_name = update.effective_user.first_name
+    
     keyboard = [
         [InlineKeyboardButton("💎 View Plans", callback_data='view_plans')],
         [InlineKeyboardButton("📜 My Subscriptions", callback_data='my_subs')],
-        [InlineKeyboardButton("📞 Support", url="https://t.me/YOUR_USERNAME_HERE")] 
+        [InlineKeyboardButton("📞 Support", url="https://t.me/Krowzen01")] 
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"Welcome {update.effective_user.first_name}!", reply_markup=reply_markup)
+    welcome_text = f"Welcome {user_first_name}! Choose an option:"
+
+    # If called from a Button (Back Button)
+    if update.callback_query:
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(text=welcome_text, reply_markup=reply_markup)
+    # If called from a Command (/start)
+    else:
+        await update.message.reply_text(text=welcome_text, reply_markup=reply_markup)
 
 async def view_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -150,13 +168,16 @@ async def view_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📢 **Available Channels**\n\n"
     keyboard = []
     
-    # Iterate over channels to build the menu
     has_channels = False
     async for ch in channels:
         has_channels = True
         text += f"🔹 **{ch['name']}**\n💰 Price: {ch['price']}\n"
-        if ch.get('demo_link') and ch['demo_link'] != "None":
-            text += f"👁️ [View Demo]({ch['demo_link']})\n"
+        
+        # Check and display Demo Link
+        demo = ch.get('demo_link')
+        if demo and demo != "None":
+            text += f"👁️ [View Demo Content]({demo})\n"
+            
         text += "-------------------\n"
         keyboard.append([InlineKeyboardButton(f"Buy {ch['name']}", callback_data=f"buy_{ch['channel_id']}")])
 
@@ -164,7 +185,9 @@ async def view_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "No plans available yet."
 
     keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='start')])
-    await query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+    
+    # disable_web_page_preview=False allows the demo link preview to show
+    await query.edit_message_text(text=text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown', disable_web_page_preview=False)
 
 async def my_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -194,18 +217,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await start(update, context)
         
     elif data.startswith('buy_'):
-        # Extract channel ID from the button data
-        ch_id = data.split('_')[1]
-        
-        # Send Invoice / Payment Instructions
+        # Send Payment Instructions
         msg = (
             f"💳 **Payment Instructions**\n\n"
-            f"To purchase access, please contact Admin: @YOUR_USERNAME_HERE\n"
-            f"Or send the amount to: `YOUR_CRYPTO_WALLET_OR_UPI`\n\n"
-            f"Include your Telegram User ID: `{query.from_user.id}` in the message.\n"
-            f"Once paid, we will activate your link immediately."
+            f"To get access, please send the payment to your preferred method.\n\n"
+            f"📸 **IMPORTANT:** After paying, send the **Screenshot** to Admin: @Krowzen01\n\n"
+            f"🆔 **Include your User ID:** `{query.from_user.id}`\n\n"
+            f"Admin will verify and grant you access immediately."
         )
+        # We send a new message so the user can easily copy the ID
         await context.bot.send_message(chat_id=query.from_user.id, text=msg, parse_mode='Markdown')
+        await query.answer("Check the message sent!")
 
 # --- BACKGROUND TASKS (AUTO KICK & WARNINGS) ---
 
@@ -213,7 +235,6 @@ async def check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
     """Checks for expired subscriptions every minute."""
     now = datetime.now(pytz.utc)
     
-    # Find active subscriptions that have expired
     cursor = subs_col.find({
         "active": True,
         "expiry_date": {"$lt": now}
@@ -224,14 +245,11 @@ async def check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
         channel_id = sub['channel_id']
         
         try:
-            # 1. Kick the user (Ban then Unban removes them)
             await context.bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
             await context.bot.unban_chat_member(chat_id=channel_id, user_id=user_id)
             
-            # 2. Mark as inactive in DB
             await subs_col.update_one({"_id": sub['_id']}, {"$set": {"active": False}})
             
-            # 3. Notify User
             await context.bot.send_message(
                 chat_id=user_id, 
                 text=f"⚠️ **Plan Expired**\n\nYour subscription for channel `{channel_id}` has ended. Please renew to rejoin.",
@@ -241,22 +259,18 @@ async def check_subscriptions(context: ContextTypes.DEFAULT_TYPE):
             
         except Exception as e:
             logger.error(f"Failed to kick user {user_id}: {e}")
-            # If bot can't kick (user left or bot not admin), just mark inactive
             if "Chat not found" in str(e) or "Not enough rights" in str(e):
                 await subs_col.update_one({"_id": sub['_id']}, {"$set": {"active": False}})
 
 # --- MAIN EXECUTION ---
 
 def main():
-    # Start Dummy Web Server for Render
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
 
-    # Initialize Bot
     application = Application.builder().token(TOKEN).build()
 
-    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("addchannel", add_channel_command))
     application.add_handler(CommandHandler("setdemo", set_demo_command))
@@ -266,11 +280,9 @@ def main():
     application.add_handler(CallbackQueryHandler(my_subs, pattern='^my_subs$'))
     application.add_handler(CallbackQueryHandler(button_handler, pattern='^start$|^buy_'))
 
-    # Job Queue for Auto-Kicking (Runs every 60 seconds)
     job_queue = application.job_queue
     job_queue.run_repeating(check_subscriptions, interval=60, first=10)
 
-    # Run Bot
     print("Bot is polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
